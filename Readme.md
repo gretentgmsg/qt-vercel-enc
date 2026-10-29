@@ -47,6 +47,7 @@ node vlessenc.js gen mlkem768 native 1
 也可以直接导入订阅链接 `https://域名/SUB_PATH`，里面已带好 encryption 和 flow。
 
 **需要留意：**
+- 排查连接问题：Vercel 环境变量加 `SHOW_LOG=1` 重新部署，Logs 里会打印每个 HTTP 请求、WS 升级、认证与隧道日志。
 - 如果 `SUB_PATH` 不满足至少 12 位，订阅接口会被关闭。
 - 连不上时先检查两点：客户端的 encryption 串必须与服务端的密钥成对；flow 只能是 `xtls-rprx-vision` 或留空。
 - 想确认 Vision 是否切到直接对拷，临时加环境变量 `VISION_DEBUG=1`，在 Vercel 日志里看每个连接关闭时的 `upDirect` 和 `downRaw`。

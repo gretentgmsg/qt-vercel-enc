@@ -16,6 +16,7 @@
  *   MAX_CONN      最大并发隧道数，默认 100
  *   IDLE_TIMEOUT  单连接空闲超时(秒)，默认 300
  *   ALLOWED_HOSTS 可选，逗号分隔的 Host 白名单（注意：看到的是 Vercel 收到的 Host）
+ *   SHOW_LOG        设为 1 时输出调试日志：每个 HTTP 请求、WS 升级、认证结果、隧道状态
  *
  * VLESS Encryption（可选，设置后 WSPATH 上跑的是加密 VLESS，平台/CDN 看不到 UUID 与目标地址）：
  *   VLESS_DECRYPTION  服务端 decryption 串，如 mlkem768x25519plus.native.0s.<私钥>
@@ -72,6 +73,9 @@ const SUB_ENABLED = SUB_PATH.length >= 12 && /^[A-Za-z0-9._~-]+$/.test(SUB_PATH)
 
 const ALLOWED_HOSTS = env('ALLOWED_HOSTS').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
+const SHOW_LOG = env('SHOW_LOG') === '1';
+function dlog(...a) { if (SHOW_LOG) console.log(...a); }
+
 const UUID_BUF = Buffer.from(UUID.replace(/-/g, ''), 'hex');
 const TROJAN_HASH = Buffer.from(crypto.createHash('sha224').update(UUID).digest('hex')); // 56 字节 ASCII
 
@@ -110,7 +114,8 @@ function send(res, code, type, body) {
   res.end(res.req && res.req.method === 'HEAD' ? undefined : body);
 }
 
-function rejectUpgrade(socket) {
+function rejectUpgrade(socket, why) {
+  dlog('[ws] upgrade rejected:', why);
   try {
     socket.write('HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\n' +
       'Content-Length: ' + Buffer.byteLength(NOT_FOUND_HTML) + '\r\nConnection: close\r\n\r\n' + NOT_FOUND_HTML);
@@ -292,11 +297,12 @@ function openTunnel(ws, t, isVless) {
 
   socket.once('connect', () => {
     clearTimeout(ct);
+    dlog(`[tunnel] upstream connected ${t.host}:${t.port}`);
     if (t.payload.length) socket.write(t.payload);
     duplex.pipe(socket);
     socket.pipe(duplex);
   });
-  socket.on('error', () => { clearTimeout(ct); socket.destroy(); duplex.destroy(); });
+  socket.on('error', e => { dlog(`[tunnel] upstream error ${t.host}:${t.port}: ${e && e.message}`); clearTimeout(ct); socket.destroy(); duplex.destroy(); });
   socket.on('close', () => { clearTimeout(ct); if (!duplex.writableEnded) duplex.end(); });
   ws.on('close', () => { clearTimeout(ct); socket.destroy(); });
 }
@@ -308,10 +314,11 @@ function fail(ws, ip) {
 
 function onConnection(ws, ip) {
   activeConns++;
+  dlog(`[ws] plain conn ip=${ip} active=${activeConns}`);
   ws.on('close', () => { activeConns--; });
   ws.on('error', () => {});
 
-  const timer = setTimeout(() => { try { ws.terminate(); } catch (e) { /* ignore */ } }, FIRST_MSG_TIMEOUT);
+  const timer = setTimeout(() => { dlog(`[ws] first msg timeout ip=${ip}`); try { ws.terminate(); } catch (e) { /* ignore */ } }, FIRST_MSG_TIMEOUT);
 
   ws.once('message', data => {
     clearTimeout(timer);
@@ -325,11 +332,16 @@ function onConnection(ws, ip) {
       target = parseTrojan(msg);
     }
 
-    if (!target) return fail(ws, ip);                        // 认证/解析失败：计入失败次数
+    if (!target) {                                            // 认证/解析失败：计入失败次数
+      dlog(`[ws] auth/parse fail ip=${ip} len=${msg.length} first=0x${msg[0] === undefined ? '-' : msg[0].toString(16)}`);
+      return fail(ws, ip);
+    }
     if (isBlockedTarget(target.host, target.port)) {         // 已认证但目标被禁止：直接断开
+      dlog(`[ws] blocked target ${target.host}:${target.port}`);
       try { ws.close(); } catch (e) { /* ignore */ }
       return;
     }
+    dlog(`[ws] ${isVless ? 'vless' : 'trojan'} tunnel open ${target.host}:${target.port}`);
     openTunnel(ws, target, isVless);
   });
 }
@@ -403,7 +415,7 @@ function openEncTunnel(ws, raw, chan, t) {
   socket.setNoDelay(true);
   socket.setTimeout(IDLE_MS, () => socket.destroy());
   const ct = setTimeout(() => socket.destroy(), CONNECT_TIMEOUT);
-  socket.once('connect', () => clearTimeout(ct));
+  socket.once('connect', () => { clearTimeout(ct); dlog(`[enc] upstream connected ${t.host}:${t.port}`); });
 
   let closed = false;
   const closeAll = () => {
@@ -413,7 +425,7 @@ function openEncTunnel(ws, raw, chan, t) {
     socket.destroy();
     try { ws.terminate(); } catch (e) { /* ignore */ }
   };
-  socket.on('error', closeAll);
+  socket.on('error', e => { dlog(`[enc] upstream error ${t.host}:${t.port}: ${e && e.message}`); closeAll(); });
   socket.on('close', () => {
     clearTimeout(ct);
     if (!closed) { closed = true; try { ws.close(); } catch (e) { /* ignore */ } }
@@ -441,33 +453,42 @@ function openEncTunnel(ws, raw, chan, t) {
 
 async function onEncConnection(ws, ip) {
   activeConns++;
+  dlog(`[enc] conn ip=${ip} active=${activeConns}`);
   ws.on('close', () => { activeConns--; });
   ws.on('error', () => {});
   const raw = createWebSocketStream(ws);
   raw.on('error', () => {});
 
   // 握手 + 请求头必须在限定时间内完成
-  const timer = setTimeout(() => { try { ws.terminate(); } catch (e) { /* ignore */ } }, FIRST_MSG_TIMEOUT);
+  const timer = setTimeout(() => { dlog(`[enc] handshake timeout ip=${ip}`); try { ws.terminate(); } catch (e) { /* ignore */ } }, FIRST_MSG_TIMEOUT);
 
   let chan, target;
   try {
     chan = await ENC.handshake(raw);
+    dlog(`[enc] handshake ok ip=${ip}`);
     target = await readVlessRequest(chan);
   } catch (e) {
     clearTimeout(timer);
     if (e && e.expired) {                                // 多实例下票据不在本实例：不算攻击，让客户端重新握手
+      dlog(`[enc] ticket expired on this instance ip=${ip}`);
       setTimeout(() => { try { ws.close(); } catch (x) { /* ignore */ } }, 200);
       return;
     }
+    dlog(`[enc] handshake fail ip=${ip}: ${e && e.message}`);
     return fail(ws, ip);
   }
   clearTimeout(timer);
 
-  if (!target) return fail(ws, ip);
+  if (!target) {
+    dlog(`[enc] vless request parse fail / unsupported flow ip=${ip}`);
+    return fail(ws, ip);
+  }
   if (isBlockedTarget(target.host, target.port)) {
+    dlog(`[enc] blocked target ${target.host}:${target.port}`);
     try { ws.close(); } catch (e) { /* ignore */ }
     return;
   }
+  dlog(`[enc] tunnel open flow=${target.flow || '-'} ${target.host}:${target.port}`);
   openEncTunnel(ws, raw, chan, target);
 }
 
@@ -497,8 +518,10 @@ const httpServer = http.createServer((req, res) => {
   req.on('error', () => {});
   const ip = clientIP(req);
   const pathname = (req.url || '/').split('?')[0];
+  dlog(`[http] ${req.method} ${pathname} host=${req.headers.host || '-'} ip=${ip}`);
 
   if ((req.method !== 'GET' && req.method !== 'HEAD') || !hostAllowed(req)) {
+    dlog('[http] -> 404 (method or host rejected)');
     return send(res, 404, 'text/html; charset=utf-8', NOT_FOUND_HTML);
   }
   if (pathname === '/' || pathname === '/index.html') {
@@ -506,8 +529,9 @@ const httpServer = http.createServer((req, res) => {
   }
   if (SUB_ENABLED && pathname === '/' + SUB_PATH && !hit('sub:' + ip, 30, 10 * 60 * 1000)) {
     const body = buildSubscription(req);
-    if (body) return send(res, 200, 'text/plain; charset=utf-8', body);
+    if (body) { dlog('[http] -> 200 subscription'); return send(res, 200, 'text/plain; charset=utf-8', body); }
   }
+  dlog('[http] -> 404 (unknown path or rate limited)');
   return send(res, 404, 'text/html; charset=utf-8', NOT_FOUND_HTML);
 });
 
@@ -517,13 +541,16 @@ httpServer.on('upgrade', (req, socket, head) => {
   socket.on('error', () => {});
   const ip = clientIP(req);
   const pathname = (req.url || '').split('?')[0];
+  dlog(`[ws] upgrade ${pathname} host=${req.headers.host || '-'} ip=${ip}`);
   // 路径不对、来源被封禁、并发已满：与普通 404 完全一致，不做 WebSocket 升级
   let mode = null;
   if (pathname === WS_PATH) mode = ENC ? 'enc' : 'plain';
   else if (ENC && ALLOW_PLAIN && pathname === PLAIN_WS_PATH) mode = 'plain';
-  if (!mode || !hostAllowed(req) || isBanned(ip) || activeConns >= MAX_CONN) {
-    return rejectUpgrade(socket);
-  }
+  if (!mode) return rejectUpgrade(socket, 'unknown path (expect ' + WS_PATH + ')');
+  if (!hostAllowed(req)) return rejectUpgrade(socket, 'host not allowed');
+  if (isBanned(ip)) return rejectUpgrade(socket, 'banned ip');
+  if (activeConns >= MAX_CONN) return rejectUpgrade(socket, `too many connections (${activeConns}/${MAX_CONN})`);
+  dlog(`[ws] upgrade accepted mode=${mode}`);
   wss.handleUpgrade(req, socket, head, ws => (mode === 'enc' ? onEncConnection(ws, ip) : onConnection(ws, ip)));
 });
 
@@ -539,6 +566,12 @@ async function start() {
   }
   httpServer.listen(PORT, () => {
     console.log(`Server is running on ${PORT}${ENC ? ' (VLESS Encryption on)' : ''}`);
+    console.log('[config] wsPath=/' + WSPATH +
+      (ENC ? ' enc=on' + (ALLOW_PLAIN ? ' plain=/'+ WSPATH + '-plain' : ' plain=off') : ' enc=off') +
+      ' sub=' + (SUB_ENABLED ? 'on' : 'off') +
+      ' allowedHosts=' + (ALLOWED_HOSTS.join(',') || 'any') +
+      ' maxConn=' + MAX_CONN +
+      ' showLog=' + SHOW_LOG);
     if (!SUB_ENABLED) console.warn('[WARN] SUB_PATH 未设置或少于 12 位，订阅接口已关闭');
   });
 }
