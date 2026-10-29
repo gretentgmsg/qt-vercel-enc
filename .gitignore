@@ -1,0 +1,9 @@
+.vscode/
+node_modules/
+AiSuggest/
+data/
+*.log
+测试/
+.env
+.claude/
+key/
