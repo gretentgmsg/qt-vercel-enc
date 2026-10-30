@@ -53,5 +53,26 @@ node vlessenc.js gen mlkem768 native 1
 - 想确认 Vision 是否切到直接对拷，临时加环境变量 `VISION_DEBUG=1`，在 Vercel 日志里看每个连接关闭时的 `upDirect` 和 `downRaw`。
 - 只有访问 HTTPS（内层 TLS 1.3）的连接才会切换并省 CPU，这是正常现象。
 
+## 安全加固
+
+**1. 前置密钥 FRONT_KEY（防直连扫描，推荐）**
+
+`*.vercel.app` 域名会进入证书透明日志，扫描器可直接枚举到你的服务端。启用前置密钥后，所有不带密钥头的直连请求一律返回 404，WS 路径、订阅路径对非 CF 入口完全隐形。
+
+1. 生成随机密钥：
+   ```
+   node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
+   ```
+2. `cf_worker.js` 顶部的 `FRONT_KEY` 改成该密钥，先重新部署 Cloudflare Worker（旧服务端会忽略多出来的请求头，不影响现有连接）
+3. Vercel 环境变量添加 `FRONT_KEY`（同一个值），再重新部署 Vercel
+
+注意：顺序不能反，先设 Vercel 后部署 Worker 会断连。启用后 `*.vercel.app` 域名不能再直连（这正是设计目的），客户端必须走 CF 域名。
+
+**2. 全站封禁与限流（默认开启，无需配置）**
+
+以下行为共用一个失败计数，10 次 / 10 分钟后该 IP 全站拉黑（全部返回 404）：未知路径 404、WS 升级路径猜错、缺少前置密钥、订阅/隧道认证失败。另有每 IP 请求限流，默认 200 次 / 分钟，可用环境变量 `REQ_LIMIT` 调整。
+
+注意：Vercel 多实例内存隔离，封禁仅对当前热实例生效，属部分防护；正常客户端永远不会触发（合法路径不产生失败计数）。
+
 
 

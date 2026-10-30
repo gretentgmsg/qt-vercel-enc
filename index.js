@@ -16,6 +16,8 @@
  *   MAX_CONN      最大并发隧道数，默认 100
  *   IDLE_TIMEOUT  单连接空闲超时(秒)，默认 300
  *   ALLOWED_HOSTS 可选，逗号分隔的 Host 白名单（注意：看到的是 Vercel 收到的 Host）
+ *   FRONT_KEY     可选，前置密钥；设置后仅接受带匹配 x-front-key 头的请求，其余一律 404（配合 CF Worker 注入）
+ *   REQ_LIMIT     每 IP 每分钟请求上限（HTTP + WS 升级合计），默认 200，超出返回 404
  *   SHOW_LOG        设为 1 时输出调试日志：每个 HTTP 请求、WS 升级、认证结果、隧道状态
  *
  * VLESS Encryption（可选，设置后 WSPATH 上跑的是加密 VLESS，平台/CDN 看不到 UUID 与目标地址）：
@@ -72,6 +74,11 @@ const SUB_PATH = env('SUB_PATH').replace(/^\/+/, '');
 const SUB_ENABLED = SUB_PATH.length >= 12 && /^[A-Za-z0-9._~-]+$/.test(SUB_PATH);
 
 const ALLOWED_HOSTS = env('ALLOWED_HOSTS').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+const FRONT_KEY = env('FRONT_KEY');
+const FRONT_KEY_BUF = FRONT_KEY ? Buffer.from(FRONT_KEY) : null;
+const REQ_LIMIT = parseInt(env('REQ_LIMIT', '200'), 10) || 200;
+const REQ_WINDOW = 60 * 1000;
 
 const SHOW_LOG = env('SHOW_LOG') === '1';
 function dlog(...a) { if (SHOW_LOG) console.log(...a); }
@@ -135,6 +142,14 @@ function hit(key, limit, windowMs) {
 function isBanned(ip) {
   const b = buckets.get('fail:' + ip);
   return !!b && Date.now() - b.t <= FAIL_WINDOW && b.n > FAIL_LIMIT;
+}
+function strike(ip) { hit('fail:' + ip, FAIL_LIMIT, FAIL_WINDOW); }
+function frontOK(req) {
+  if (!FRONT_KEY_BUF) return true;
+  const v = req.headers['x-front-key'];
+  if (typeof v !== 'string') return false;
+  const a = Buffer.from(v);
+  return a.length === FRONT_KEY_BUF.length && crypto.timingSafeEqual(a, FRONT_KEY_BUF);
 }
 setInterval(() => {
   const now = Date.now();
@@ -308,7 +323,7 @@ function openTunnel(ws, t, isVless) {
 }
 
 function fail(ws, ip) {
-  hit('fail:' + ip, FAIL_LIMIT, FAIL_WINDOW);
+  strike(ip);
   setTimeout(() => { try { ws.terminate(); } catch (e) { /* ignore */ } }, 1000 + Math.random() * 3000);
 }
 
@@ -520,8 +535,11 @@ const httpServer = http.createServer((req, res) => {
   const pathname = (req.url || '/').split('?')[0];
   dlog(`[http] ${req.method} ${pathname} host=${req.headers.host || '-'} ip=${ip}`);
 
+  if (isBanned(ip)) { dlog('[http] -> 404 (banned ip)'); return send(res, 404, 'text/html; charset=utf-8', NOT_FOUND_HTML); }
+  if (hit('req:' + ip, REQ_LIMIT, REQ_WINDOW)) { dlog('[http] -> 404 (rate limited)'); return send(res, 404, 'text/html; charset=utf-8', NOT_FOUND_HTML); }
+  if (!frontOK(req)) { dlog('[http] -> 404 (no front key)'); strike(ip); return send(res, 404, 'text/html; charset=utf-8', NOT_FOUND_HTML); }
   if ((req.method !== 'GET' && req.method !== 'HEAD') || !hostAllowed(req)) {
-    dlog('[http] -> 404 (method or host rejected)');
+    dlog('[http] -> 404 (method or host rejected)'); strike(ip);
     return send(res, 404, 'text/html; charset=utf-8', NOT_FOUND_HTML);
   }
   if (pathname === '/' || pathname === '/index.html') {
@@ -531,7 +549,7 @@ const httpServer = http.createServer((req, res) => {
     const body = buildSubscription(req);
     if (body) { dlog('[http] -> 200 subscription'); return send(res, 200, 'text/plain; charset=utf-8', body); }
   }
-  dlog('[http] -> 404 (unknown path or rate limited)');
+  dlog('[http] -> 404 (unknown path or rate limited)'); strike(ip);
   return send(res, 404, 'text/html; charset=utf-8', NOT_FOUND_HTML);
 });
 
@@ -542,13 +560,15 @@ httpServer.on('upgrade', (req, socket, head) => {
   const ip = clientIP(req);
   const pathname = (req.url || '').split('?')[0];
   dlog(`[ws] upgrade ${pathname} host=${req.headers.host || '-'} ip=${ip}`);
-  // 路径不对、来源被封禁、并发已满：与普通 404 完全一致，不做 WebSocket 升级
+  // 路径不对、密钥缺失、来源被封禁、限流、并发已满：与普通 404 完全一致，不做 WebSocket 升级
+  if (isBanned(ip)) return rejectUpgrade(socket, 'banned ip');
+  if (hit('req:' + ip, REQ_LIMIT, REQ_WINDOW)) return rejectUpgrade(socket, 'rate limited');
+  if (!frontOK(req)) { strike(ip); return rejectUpgrade(socket, 'no front key'); }
   let mode = null;
   if (pathname === WS_PATH) mode = ENC ? 'enc' : 'plain';
   else if (ENC && ALLOW_PLAIN && pathname === PLAIN_WS_PATH) mode = 'plain';
-  if (!mode) return rejectUpgrade(socket, 'unknown path (expect ' + WS_PATH + ')');
+  if (!mode) { strike(ip); return rejectUpgrade(socket, 'unknown path (expect ' + WS_PATH + ')'); }
   if (!hostAllowed(req)) return rejectUpgrade(socket, 'host not allowed');
-  if (isBanned(ip)) return rejectUpgrade(socket, 'banned ip');
   if (activeConns >= MAX_CONN) return rejectUpgrade(socket, `too many connections (${activeConns}/${MAX_CONN})`);
   dlog(`[ws] upgrade accepted mode=${mode}`);
   wss.handleUpgrade(req, socket, head, ws => (mode === 'enc' ? onEncConnection(ws, ip) : onConnection(ws, ip)));
@@ -571,6 +591,8 @@ async function start() {
       ' sub=' + (SUB_ENABLED ? 'on' : 'off') +
       ' allowedHosts=' + (ALLOWED_HOSTS.join(',') || 'any') +
       ' maxConn=' + MAX_CONN +
+      ' frontKey=' + (FRONT_KEY ? 'on' : 'off') +
+      ' reqLimit=' + REQ_LIMIT + '/min' +
       ' showLog=' + SHOW_LOG);
     if (!SUB_ENABLED) console.warn('[WARN] SUB_PATH 未设置或少于 12 位，订阅接口已关闭');
   });

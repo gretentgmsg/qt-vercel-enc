@@ -144,7 +144,7 @@ class ByteReader {
   async read(n) {
     if (n === 0) return Buffer.alloc(0);
     while (this.n < n) {
-      if (this.done) throw new Error('unexpected EOF');
+      if (this.done) throw new Error(`unexpected EOF (got ${this.n}/${n} bytes)`);
       await new Promise(r => { this.w = r; });
     }
     const parts = [];
@@ -162,7 +162,7 @@ class ByteReader {
 
 ByteReader.prototype.readAny = async function () {
   while (this.n === 0) {
-    if (this.done) throw new Error('unexpected EOF');
+    if (this.done) throw new Error(`unexpected EOF (got ${this.n} bytes, waiting for any)`);
     await new Promise(r => { this.w = r; });
   }
   const all = this.q.length === 1 ? this.q[0] : Buffer.concat(this.q);
