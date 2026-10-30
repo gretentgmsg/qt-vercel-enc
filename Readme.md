@@ -75,5 +75,22 @@ node vlessenc.js gen mlkem768 native 1
 
 注意：Vercel 多实例内存隔离，封禁仅对当前热实例生效，属部分防护；正常客户端永远不会触发（合法路径不产生失败计数）。
 
+**3. CF Worker 客户端认证 AUTH_KEY（防白嫖代理）**
+
+默认情况下任何知道 CF 域名的人都能借你的 Worker 中转到 Vercel。启用认证后，请求必须携带凭据，否则在 CF 边缘直接 401，不会消耗 Vercel 调用。
+
+凭据格式为 `用户名:密码`（建议 ASCII 字符），两种携带方式任选其一：
+
+- URL 参数：`https://域名/路径?auth=用户名:密码`（分享链接、订阅、浏览器均支持）
+- 标准头：`Authorization: Basic base64(用户名:密码)`（浏览器访问时输入一次即可）
+
+配置步骤：
+
+1. 想好一个 `用户名:密码`，Vercel 环境变量添加 `AUTH_KEY`（该值）并重新部署 —— 订阅链接会自动带上 `?auth=`，旧 Worker 会忽略这个参数，不影响现有连接
+2. Cloudflare Worker 后台 Settings → Variables 添加 `AUTH_KEY`（该值，建议加密类型 Secret）并重新部署 —— 认证开始生效（也可改 `cf_worker.js` 顶部的常量，但仓库公开时勿把真实密码写进代码）
+3. v2rayN 更新订阅（订阅地址本身也要带上 `?auth=用户名:密码`）
+
+注意顺序：必须先 Vercel 后 Worker，反过来旧节点会 401 断连。手动配置节点时，路径要写成 `/WSPATH?auth=用户名:密码`。
+
 
 

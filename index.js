@@ -12,6 +12,7 @@
  *   DOMAIN        订阅里使用的域名（不设置则取请求的 Host）
  *   NAME          节点名称，默认 Proxy
  *   CLIENT_FP     订阅里给客户端的 uTLS 指纹，默认 firefox（chrome 指纹在境内被针对会断流）
+ *   AUTH_KEY      可选，与 CF Worker 的认证凭据一致（格式 用户名:密码）；设置后订阅链接的 path 会带 ?auth=
  *   WSPATH        可选，WebSocket 路径；默认由 UUID 派生的 16 位十六进制串
  *   PORT          监听端口，默认 3000
  *   MAX_CONN      最大并发隧道数，默认 100
@@ -53,6 +54,7 @@ if (!UUID_RE.test(UUID)) {
 const DOMAIN = env('DOMAIN');
 const NAME = env('NAME', 'vercel 加密 流控');
 const CLIENT_FP = env('CLIENT_FP', 'firefox') || 'firefox';  // 订阅给客户端的 uTLS 指纹；chrome 在境内已被针对
+const AUTH_KEY = env('AUTH_KEY');                            // 与 CF Worker 的 AUTH_KEY 一致；订阅链接 path 会带上 ?auth=
 const PORT = parseInt(env('PORT', '3000'), 10) || 3000;
 const MAX_CONN = parseInt(env('MAX_CONN', '100'), 10) || 100;
 const IDLE_MS = (parseInt(env('IDLE_TIMEOUT', '300'), 10) || 300) * 1000;
@@ -492,6 +494,10 @@ async function onEncConnection(ws, ip) {
       return;
     }
     dlog(`[enc] handshake fail ip=${ip}: ${e && e.message}`);
+    if (e && e.got0) {                                     // 零字节断开：网络中断而非攻击，不计入封禁
+      try { ws.terminate(); } catch (x) { /* ignore */ }
+      return;
+    }
     return fail(ws, ip);
   }
   clearTimeout(timer);
@@ -514,17 +520,18 @@ function buildSubscription(req) {
   const domain = DOMAIN || (req.headers.host || '').split(':')[0];
   if (!/^[A-Za-z0-9.-]+$/.test(domain)) return null;
   const name = encodeURIComponent(NAME);
+  const authQ = AUTH_KEY ? '?auth=' + encodeURIComponent(AUTH_KEY) : '';
   const base = `security=tls&sni=${domain}&fp=${CLIENT_FP}&type=ws&host=${domain}`;
   const links = [];
   if (ENC) {
-    links.push(`vless://${UUID}@${domain}:443?encryption=${encodeURIComponent(ENC_CLIENT)}&flow=xtls-rprx-vision&${base}&path=${encodeURIComponent(WS_PATH)}#${name}`);
+    links.push(`vless://${UUID}@${domain}:443?encryption=${encodeURIComponent(ENC_CLIENT)}&flow=xtls-rprx-vision&${base}&path=${encodeURIComponent(WS_PATH + authQ)}#${name}`);
     if (ALLOW_PLAIN) {
-      const q = `${base}&path=${encodeURIComponent(PLAIN_WS_PATH)}`;
+      const q = `${base}&path=${encodeURIComponent(PLAIN_WS_PATH + authQ)}`;
       links.push(`vless://${UUID}@${domain}:443?encryption=none&${q}#${encodeURIComponent(NAME + '-plain')}`);
       links.push(`trojan://${UUID}@${domain}:443?${q}#${encodeURIComponent(NAME + '-plain-trojan')}`);
     }
   } else {
-    const q = `${base}&path=${encodeURIComponent(WS_PATH)}`;
+    const q = `${base}&path=${encodeURIComponent(WS_PATH + authQ)}`;
     links.push(`vless://${UUID}@${domain}:443?encryption=none&${q}#${name}`);
     links.push(`trojan://${UUID}@${domain}:443?${q}#${name}`);
   }
