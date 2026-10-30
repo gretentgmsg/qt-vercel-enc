@@ -11,6 +11,7 @@
  *   SUB_PATH      订阅路径，建议 ≥16 位随机串；未设置/过短则关闭订阅接口
  *   DOMAIN        订阅里使用的域名（不设置则取请求的 Host）
  *   NAME          节点名称，默认 Proxy
+ *   CLIENT_FP     订阅里给客户端的 uTLS 指纹，默认 firefox（chrome 指纹在境内被针对会断流）
  *   WSPATH        可选，WebSocket 路径；默认由 UUID 派生的 16 位十六进制串
  *   PORT          监听端口，默认 3000
  *   MAX_CONN      最大并发隧道数，默认 100
@@ -50,7 +51,8 @@ if (!UUID_RE.test(UUID)) {
 }
 
 const DOMAIN = env('DOMAIN');
-const NAME = env('NAME', 'Proxy');
+const NAME = env('NAME', 'vercel 加密 流控');
+const CLIENT_FP = env('CLIENT_FP', 'firefox') || 'firefox';  // 订阅给客户端的 uTLS 指纹；chrome 在境内已被针对
 const PORT = parseInt(env('PORT', '3000'), 10) || 3000;
 const MAX_CONN = parseInt(env('MAX_CONN', '100'), 10) || 100;
 const IDLE_MS = (parseInt(env('IDLE_TIMEOUT', '300'), 10) || 300) * 1000;
@@ -512,7 +514,7 @@ function buildSubscription(req) {
   const domain = DOMAIN || (req.headers.host || '').split(':')[0];
   if (!/^[A-Za-z0-9.-]+$/.test(domain)) return null;
   const name = encodeURIComponent(NAME);
-  const base = `security=tls&sni=${domain}&fp=chrome&type=ws&host=${domain}`;
+  const base = `security=tls&sni=${domain}&fp=${CLIENT_FP}&type=ws&host=${domain}`;
   const links = [];
   if (ENC) {
     links.push(`vless://${UUID}@${domain}:443?encryption=${encodeURIComponent(ENC_CLIENT)}&flow=xtls-rprx-vision&${base}&path=${encodeURIComponent(WS_PATH)}#${name}`);

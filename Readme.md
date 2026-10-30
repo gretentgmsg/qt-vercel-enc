@@ -29,6 +29,7 @@ node vlessenc.js gen mlkem768 native 1
 | `SUB_PATH` | 至少 12 位的订阅路径 |
 | `VLESS_DECRYPTION` | 第 1 步输出的服务端串 |
 | `DOMAIN` | 你的 Cloudflare 域名（订阅里用） |
+| `CLIENT_FP` | 可选，订阅里客户端的 uTLS 指纹，默认 `firefox`（`chrome` 指纹在境内被针对会断流） |
 
 设置后重新部署。Cloudflare Worker 不用改。
 
